@@ -10,6 +10,7 @@ const clientToken = process.env.MCP_CLIENT_TOKEN;
 const host = process.env.MCP_HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const allowedHost = process.env.MCP_ALLOWED_HOST;
+const mountPath = (process.env.MCP_MOUNT_PATH || '/fic-ai-mcp').replace(/\/$/, '');
 
 if (!upstreamSecret || !clientToken || !allowedHost) {
   throw new Error('Set FIC_AI_SECRET, MCP_CLIENT_TOKEN and MCP_ALLOWED_HOST');
@@ -122,12 +123,13 @@ const handler = createMcpHandler(() => {
 });
 
 const app = createMcpExpressApp({ host, allowedHosts: [allowedHost] });
-app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'fic-ai-test-mcp' }));
-app.use('/mcp', (req, res, next) => {
+app.get([mountPath + '/healthz', '/healthz'], (_req, res) => res.json({ ok: true, service: 'fic-ai-test-mcp' }));
+const mcpPaths = [mountPath + '/mcp', '/mcp'];
+app.use(mcpPaths, (req, res, next) => {
   const header = req.get('authorization') || '';
   if (!header.startsWith('Bearer ') || !equalToken(header.slice(7), clientToken)) return res.sendStatus(401);
   next();
 });
 const nodeHandler = toNodeHandler(handler);
-app.all('/mcp', (req, res) => void nodeHandler(req, res, req.body));
+app.all(mcpPaths, (req, res) => void nodeHandler(req, res, req.body));
 app.listen(port, host, () => process.stdout.write('FIC AI TEST MCP listening on ' + host + ':' + port + '\n'));

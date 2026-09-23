@@ -123,13 +123,26 @@ const handler = createMcpHandler(() => {
 });
 
 const app = createMcpExpressApp({ host, allowedHosts: [allowedHost] });
-app.get([mountPath + '/healthz', '/healthz'], (_req, res) => res.json({ ok: true, service: 'fic-ai-test-mcp' }));
-const mcpPaths = [mountPath + '/mcp', '/mcp'];
-app.use(mcpPaths, (req, res, next) => {
-  const header = req.get('authorization') || '';
-  if (!header.startsWith('Bearer ') || !equalToken(header.slice(7), clientToken)) return res.sendStatus(401);
+const nodeHandler = toNodeHandler(handler);
+
+// cPanel/LiteSpeed Passenger may preserve the public application prefix in req.url.
+// Match by safe path suffix so the same app works both directly and under /fic-ai-mcp.
+app.use((req, res, next) => {
+  const pathname = (req.path || '').replace(/\/+$/, '') || '/';
+
+  if (req.method === 'GET' && pathname.endsWith('/healthz')) {
+    return res.json({ ok: true, service: 'fic-ai-test-mcp' });
+  }
+
+  if (pathname.endsWith('/mcp')) {
+    const header = req.get('authorization') || '';
+    if (!header.startsWith('Bearer ') || !equalToken(header.slice(7), clientToken)) {
+      return res.sendStatus(401);
+    }
+    return void nodeHandler(req, res, req.body);
+  }
+
   next();
 });
-const nodeHandler = toNodeHandler(handler);
-app.all(mcpPaths, (req, res) => void nodeHandler(req, res, req.body));
+
 app.listen(port, host, () => process.stdout.write('FIC AI TEST MCP listening on ' + host + ':' + port + '\n'));

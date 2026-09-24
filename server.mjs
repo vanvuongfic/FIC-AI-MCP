@@ -170,12 +170,15 @@ async function githubCherryPickToTest(commitSha) {
   if (!/^[0-9a-f]{7,40}$/i.test(value)) throw new Error('GitHub cherry-pick invalid commit SHA');
 
   const workdir = await mkdtemp(tmpdir() + '/fic-ai-cherry-pick-');
+  // Git-over-HTTPS uses HTTP Basic auth. Keep the token only in the child
+  // process environment so it is never embedded in the remote URL or output.
+  const gitBasicAuth = Buffer.from('x-access-token:' + githubToken, 'utf8').toString('base64');
   const gitEnv = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_COUNT: '1',
     GIT_CONFIG_KEY_0: 'http.extraHeader',
-    GIT_CONFIG_VALUE_0: 'Authorization: Bearer ' + githubToken
+    GIT_CONFIG_VALUE_0: 'Authorization: Basic ' + gitBasicAuth
   };
   const git = async (args, options = {}) => {
     try {

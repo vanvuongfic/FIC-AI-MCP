@@ -2,7 +2,7 @@ import { createMcpExpressApp } from '@modelcontextprotocol/express';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { timingSafeEqual } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, stat, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -20,6 +20,7 @@ const githubApi = 'https://api.github.com';
 const mountPath = (process.env.MCP_MOUNT_PATH || '/fic-ai-mcp').replace(/\/$/, '');
 const execFileAsync = promisify(execFile);
 const testDeployHelper = '/home/timxerzf/.fic-ai-test-actions/deploy-test.sh';
+const testHostingRoot = '/home/timxerzf/fic-fnb-test-laravel';
 
 if (!upstreamSecret || !clientToken || !allowedHost || !githubToken) {
   throw new Error('Set FIC_AI_SECRET, MCP_CLIENT_TOKEN, MCP_ALLOWED_HOST and GITHUB_TOKEN');
@@ -334,6 +335,35 @@ async function githubSearchCode(query) {
     items: items.map(item => ({ name: item.name, path: item.path, sha: item.sha, html_url: item.html_url }))
   });
 }
+function checkedHostingPath(path) {
+  const value = String(path || '').replace(/\\/g, '/').replace(/^\\/+/, '');
+  if (!value || value.length > 500 || value.includes('..') || value.includes('\\0')) throw new Error('Hosting TEST invalid path');
+  if (!/^(app|resources|routes|config|public)\//.test(value)) throw new Error('Hosting TEST path not allowed');
+  if (/(^|\/)\.env($|\/)|(^|\/)(storage|vendor|node_modules|\.git)(\/|$)/.test(value)) throw new Error('Hosting TEST path not allowed');
+  return value;
+}
+async function hostingReadFileTest(path) {
+  const safePath = checkedHostingPath(path);
+  const fullPath = testHostingRoot + '/' + safePath;
+  const info = await stat(fullPath);
+  if (!info.isFile()) throw new Error('Hosting TEST path is not a file');
+  if (info.size > 1000000) throw new Error('Hosting TEST file exceeds 1 MB');
+  const content = await readFile(fullPath, 'utf8');
+  return { path: safePath, size: info.size, content };
+}
+async function hostingUpdateFileTest(path, content) {
+  const safePath = checkedHostingPath(path);
+  const fullPath = testHostingRoot + '/' + safePath;
+  const info = await stat(fullPath);
+  if (!info.isFile()) throw new Error('Hosting TEST path is not a file');
+  const next = String(content ?? '');
+  if (Buffer.byteLength(next, 'utf8') > 1000000) throw new Error('Hosting TEST file exceeds 1 MB');
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+  const backupPath = fullPath + '.FIC-AI-BACKUP-' + stamp;
+  await copyFile(fullPath, backupPath);
+  await writeFile(fullPath, next, 'utf8');
+  return { path: safePath, bytes: Buffer.byteLength(next, 'utf8'), backup: safePath + '.FIC-AI-BACKUP-' + stamp };
+}
 async function hostingAction(action) {
   if (!['status', 'pull', 'clear-cache', 'deploy'].includes(action)) throw new Error('Hosting action not allowed');
   const { stdout, stderr } = await execFileAsync(testDeployHelper, [action], {
@@ -360,7 +390,7 @@ function tool(fn) {
     } catch (e) {
       return {
         isError: true,
-        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API'].includes(e.message) ? e.message : /^GitHub (API|write|cherry-pick) (HTTP \\d{3}( PATH \/[^ ]+)?|git failed:|invalid |merge commits|commit is not an ancestor|test\/main changed|conflict:|)/.test(String(e.message || '')) ? e.message : /^GitHub (path is not a file|file SHA changed|TEST file SHA changed|branch ref unavailable|TEST diagnostic)/.test(String(e.message || '')) ? e.message : 'TEST diagnostic request failed.' }]
+        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API', 'Hosting TEST invalid path', 'Hosting TEST path not allowed', 'Hosting TEST path is not a file', 'Hosting TEST file exceeds 1 MB'].includes(e.message) ? e.message : /^GitHub (API|write|cherry-pick) (HTTP \\d{3}( PATH \/[^ ]+)?|git failed:|invalid |merge commits|commit is not an ancestor|test\/main changed|conflict:|)/.test(String(e.message || '')) ? e.message : /^GitHub (path is not a file|file SHA changed|TEST file SHA changed|branch ref unavailable|TEST diagnostic)/.test(String(e.message || '')) ? e.message : 'TEST diagnostic request failed.' }]
       };
     }
   };
@@ -369,7 +399,7 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.2' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.6.0' });
   server.registerTool('github_compare_branches', {
     description: 'Compare FIC-POS test/main with develop before promotion. TEST workflow only.',
     inputSchema: empty
@@ -402,6 +432,14 @@ const handler = createMcpHandler(() => {
     description: 'Fast-forward FIC-POS test/main to current develop HEAD only when histories are compatible. Never force pushes and never touches pro/main.',
     inputSchema: z.object({ expected_develop_sha: z.string().min(7).max(64).optional() })
   }, tool(({ expected_develop_sha }) => githubPromoteToTest(expected_develop_sha)));
+  server.registerTool('hosting_read_file_test', {
+    description: 'Read one existing source file directly from FIC POS Hosting TEST working tree. TEST only; blocks .env, storage, vendor, node_modules and .git.',
+    inputSchema: z.object({ path: z.string().min(1).max(500) })
+  }, tool(({ path }) => hostingReadFileTest(path)));
+  server.registerTool('hosting_update_file_test', {
+    description: 'Replace one existing source file directly in FIC POS Hosting TEST working tree after making a timestamped side-by-side backup. TEST only; never Production.',
+    inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000) })
+  }, tool(({ path, content }) => hostingUpdateFileTest(path, content)));
   server.registerTool('hosting_status', {
     description: 'Read FIC POS Hosting TEST git branch, HEAD and working-tree status. TEST only.',
     inputSchema: empty

@@ -10,10 +10,13 @@ const clientToken = process.env.MCP_CLIENT_TOKEN;
 const host = process.env.MCP_HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const allowedHost = process.env.MCP_ALLOWED_HOST;
+const githubToken = process.env.GITHUB_TOKEN;
+const githubRepo = 'vanvuongfic/FIC-POS';
+const githubApi = 'https://api.github.com';
 const mountPath = (process.env.MCP_MOUNT_PATH || '/fic-ai-mcp').replace(/\/$/, '');
 
-if (!upstreamSecret || !clientToken || !allowedHost) {
-  throw new Error('Set FIC_AI_SECRET, MCP_CLIENT_TOKEN and MCP_ALLOWED_HOST');
+if (!upstreamSecret || !clientToken || !allowedHost || !githubToken) {
+  throw new Error('Set FIC_AI_SECRET, MCP_CLIENT_TOKEN, MCP_ALLOWED_HOST and GITHUB_TOKEN');
 }
 if (clientToken === upstreamSecret) throw new Error('Use separate MCP and upstream credentials');
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
@@ -65,6 +68,54 @@ async function upstream(path, params = {}) {
   if (Buffer.byteLength(raw) > 1000000) throw new Error('Response exceeds 1 MB');
   return scrub(JSON.parse(raw));
 }
+async function github(path, params = {}) {
+  const url = new URL(path, githubApi);
+  appendQuery(url, params);
+  const response = await fetch(url, {
+    method: 'GET',
+    redirect: 'error',
+    headers: {
+      Authorization: 'Bearer ' + githubToken,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'fic-ai-test-mcp'
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) throw new Error('GitHub API HTTP ' + response.status);
+  const raw = await response.text();
+  if (Buffer.byteLength(raw) > 1000000) throw new Error('Response exceeds 1 MB');
+  return scrub(JSON.parse(raw));
+}
+function checkedGitRef(ref) {
+  const value = ref || 'develop';
+  if (!['develop', 'test/main'].includes(value)) throw new Error('GitHub ref not allowed');
+  return value;
+}
+function checkedGitPath(path) {
+  const value = String(path || '').replace(/^\/+/, '');
+  if (!value || value.includes('..') || value.length > 500) throw new Error('Invalid GitHub path');
+  return value;
+}
+async function githubReadFile(path, ref) {
+  const safePath = checkedGitPath(path);
+  const safeRef = checkedGitRef(ref);
+  const data = await github('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), { ref: safeRef });
+  if (data.type !== 'file' || !data.content) throw new Error('GitHub path is not a file');
+  const content = Buffer.from(String(data.content).replace(/\n/g, ''), 'base64').toString('utf8');
+  return scrub({ repository: githubRepo, ref: safeRef, path: safePath, sha: data.sha, content });
+}
+async function githubSearchCode(query) {
+  const q = String(query || '').trim();
+  if (!q || q.length > 200) throw new Error('Invalid GitHub query');
+  const data = await github('/search/code', { q: q + ' repo:' + githubRepo });
+  const items = Array.isArray(data.items) ? data.items.slice(0, 20) : [];
+  return scrub({
+    repository: githubRepo,
+    note: 'Search locates source paths; use github_read_file with ref develop or test/main for exact branch content.',
+    items: items.map(item => ({ name: item.name, path: item.path, sha: item.sha, html_url: item.html_url }))
+  });
+}
 async function allowedTables() {
   const data = await upstream('/api/internal/fic-ai/tables');
   return new Set(Array.isArray(data.tables) ? data.tables : []);
@@ -92,6 +143,17 @@ const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
   const server = new McpServer({ name: 'fic-ai-test', version: '0.2.0' });
+  server.registerTool('github_read_file', {
+    description: 'Read one source file from vanvuongfic/FIC-POS. Read-only. Allowed refs: develop and test/main.',
+    inputSchema: z.object({
+      path: z.string().min(1).max(500),
+      ref: z.enum(['develop', 'test/main']).optional()
+    })
+  }, tool(({ path, ref }) => githubReadFile(path, ref)));
+  server.registerTool('github_search_code', {
+    description: 'Search source paths in vanvuongfic/FIC-POS using GitHub code search. Read-only.',
+    inputSchema: z.object({ query: z.string().min(1).max(200) })
+  }, tool(({ query }) => githubSearchCode(query)));
   server.registerTool('health', { description: 'Read FIC POS TEST health', inputSchema: empty }, tool(() => upstream('/api/internal/fic-ai/health')));
   server.registerTool('runtime', { description: 'Read sanitized FIC POS TEST runtime information', inputSchema: empty }, tool(() => upstream('/api/internal/fic-ai/runtime')));
   server.registerTool('latest_errors', {

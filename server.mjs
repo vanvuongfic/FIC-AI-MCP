@@ -91,6 +91,77 @@ async function github(path, params = {}) {
   if (Buffer.byteLength(raw) > 1000000) throw new Error('Response exceeds 1 MB');
   return scrub(JSON.parse(raw));
 }
+async function githubWrite(path, method, body) {
+  const url = new URL(path, githubApi);
+  const response = await fetch(url, {
+    method,
+    redirect: 'error',
+    headers: {
+      Authorization: 'Bearer ' + githubToken,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'fic-ai-test-mcp'
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000)
+  });
+  const raw = await response.text();
+  if (!response.ok) throw new Error('GitHub write HTTP ' + response.status);
+  if (Buffer.byteLength(raw) > 1000000) throw new Error('Response exceeds 1 MB');
+  return raw ? scrub(JSON.parse(raw)) : {};
+}
+async function githubRef(ref) {
+  return github('/repos/' + githubRepo + '/git/ref/heads/' + ref.split('/').map(encodeURIComponent).join('/'));
+}
+async function githubCompare(base, head) {
+  return github('/repos/' + githubRepo + '/compare/' + encodeURIComponent(base) + '...' + encodeURIComponent(head));
+}
+async function githubUpdateFileDevelop(path, content, sha, message) {
+  const safePath = checkedGitPath(path);
+  const current = await githubReadFile(safePath, 'develop');
+  if (current.sha !== sha) throw new Error('GitHub file SHA changed');
+  const data = await githubWrite('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), 'PUT', {
+    message: String(message || 'Update TEST source').slice(0, 200),
+    content: Buffer.from(String(content), 'utf8').toString('base64'),
+    sha,
+    branch: 'develop'
+  });
+  return scrub({ repository: githubRepo, branch: 'develop', path: safePath, commit_sha: data.commit?.sha, content_sha: data.content?.sha });
+}
+async function githubCreateFileDevelop(path, content, message) {
+  const safePath = checkedGitPath(path);
+  const data = await githubWrite('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), 'PUT', {
+    message: String(message || 'Create TEST source').slice(0, 200),
+    content: Buffer.from(String(content), 'utf8').toString('base64'),
+    branch: 'develop'
+  });
+  return scrub({ repository: githubRepo, branch: 'develop', path: safePath, commit_sha: data.commit?.sha, content_sha: data.content?.sha });
+}
+async function githubDeleteFileDevelop(path, sha, message) {
+  const safePath = checkedGitPath(path);
+  const current = await githubReadFile(safePath, 'develop');
+  if (current.sha !== sha) throw new Error('GitHub file SHA changed');
+  const data = await githubWrite('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), 'DELETE', {
+    message: String(message || 'Delete TEST source').slice(0, 200),
+    sha,
+    branch: 'develop'
+  });
+  return scrub({ repository: githubRepo, branch: 'develop', path: safePath, commit_sha: data.commit?.sha });
+}
+async function githubPromoteToTest(expectedDevelopSha) {
+  const develop = await githubRef('develop');
+  const test = await githubRef('test/main');
+  const developSha = develop.object?.sha;
+  const testSha = test.object?.sha;
+  if (!developSha || !testSha) throw new Error('GitHub branch ref unavailable');
+  if (expectedDevelopSha && expectedDevelopSha !== developSha) throw new Error('Develop HEAD changed');
+  const comparison = await githubCompare(testSha, developSha);
+  if (!['ahead', 'identical'].includes(comparison.status)) throw new Error('test/main cannot fast-forward to develop');
+  if (comparison.status === 'identical') return { repository: githubRepo, changed: false, develop_sha: developSha, test_sha: testSha };
+  await githubWrite('/repos/' + githubRepo + '/git/refs/heads/test/main', 'PATCH', { sha: developSha, force: false });
+  return { repository: githubRepo, changed: true, previous_test_sha: testSha, test_sha: developSha, develop_sha: developSha };
+}
 function checkedGitRef(ref) {
   const value = ref || 'develop';
   if (!['develop', 'test/main'].includes(value)) throw new Error('GitHub ref not allowed');
@@ -155,7 +226,31 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.3.0' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.4.0' });
+  server.registerTool('github_compare_branches', {
+    description: 'Compare FIC-POS test/main with develop before promotion. TEST workflow only.',
+    inputSchema: empty
+  }, tool(async () => {
+    const data = await githubCompare('test/main', 'develop');
+    return scrub({ status: data.status, ahead_by: data.ahead_by, behind_by: data.behind_by, total_commits: data.total_commits,
+      files: (data.files || []).slice(0, 100).map(f => ({ filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, changes: f.changes })) });
+  }));
+  server.registerTool('github_update_file_develop', {
+    description: 'Replace one existing FIC-POS file on develop using its current blob SHA. TEST development only; never writes pro/main.',
+    inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000), sha: z.string().min(7).max(64), message: z.string().min(1).max(200) })
+  }, tool(({ path, content, sha, message }) => githubUpdateFileDevelop(path, content, sha, message)));
+  server.registerTool('github_create_file_develop', {
+    description: 'Create one FIC-POS source file on develop. TEST development only; never writes pro/main.',
+    inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000), message: z.string().min(1).max(200) })
+  }, tool(({ path, content, message }) => githubCreateFileDevelop(path, content, message)));
+  server.registerTool('github_delete_file_develop', {
+    description: 'Delete one FIC-POS file from develop using its current blob SHA. TEST development only; never writes pro/main.',
+    inputSchema: z.object({ path: z.string().min(1).max(500), sha: z.string().min(7).max(64), message: z.string().min(1).max(200) })
+  }, tool(({ path, sha, message }) => githubDeleteFileDevelop(path, sha, message)));
+  server.registerTool('github_promote_to_test', {
+    description: 'Fast-forward FIC-POS test/main to current develop HEAD only when histories are compatible. Never force pushes and never touches pro/main.',
+    inputSchema: z.object({ expected_develop_sha: z.string().min(7).max(64).optional() })
+  }, tool(({ expected_develop_sha }) => githubPromoteToTest(expected_develop_sha)));
   server.registerTool('hosting_status', {
     description: 'Read FIC POS Hosting TEST git branch, HEAD and working-tree status. TEST only.',
     inputSchema: empty

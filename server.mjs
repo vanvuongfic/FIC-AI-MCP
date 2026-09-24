@@ -131,6 +131,18 @@ async function githubUpdateFileDevelop(path, content, sha, message) {
   });
   return scrub({ repository: githubRepo, branch: 'develop', path: safePath, commit_sha: data.commit?.sha, content_sha: data.content?.sha });
 }
+async function githubUpdateFileTest(path, content, sha, message) {
+  const safePath = checkedGitPath(path);
+  const current = await githubReadFile(safePath, 'test/main');
+  if (current.sha !== sha) throw new Error('GitHub TEST file SHA changed');
+  const data = await githubWrite('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), 'PUT', {
+    message: String(message || 'Update TEST release source').slice(0, 200),
+    content: Buffer.from(String(content), 'utf8').toString('base64'),
+    sha,
+    branch: 'test/main'
+  });
+  return scrub({ repository: githubRepo, branch: 'test/main', path: safePath, commit_sha: data.commit?.sha, content_sha: data.content?.sha });
+}
 async function githubCreateFileDevelop(path, content, message) {
   const safePath = checkedGitPath(path);
   const data = await githubWrite('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), 'PUT', {
@@ -350,7 +362,7 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.0' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.1' });
   server.registerTool('github_compare_branches', {
     description: 'Compare FIC-POS test/main with develop before promotion. TEST workflow only.',
     inputSchema: empty
@@ -363,6 +375,10 @@ const handler = createMcpHandler(() => {
     description: 'Replace one existing FIC-POS file on develop using its current blob SHA. TEST development only; never writes pro/main.',
     inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000), sha: z.string().min(7).max(64), message: z.string().min(1).max(200) })
   }, tool(({ path, content, sha, message }) => githubUpdateFileDevelop(path, content, sha, message)));
+  server.registerTool('github_update_file_test', {
+    description: 'Replace exactly one existing FIC-POS file on test/main using its current blob SHA. TEST hotfix/conflict resolution only; never writes develop or pro/main.',
+    inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000), sha: z.string().min(7).max(64), message: z.string().min(1).max(200) })
+  }, tool(({ path, content, sha, message }) => githubUpdateFileTest(path, content, sha, message)));
   server.registerTool('github_create_file_develop', {
     description: 'Create one FIC-POS source file on develop. TEST development only; never writes pro/main.',
     inputSchema: z.object({ path: z.string().min(1).max(500), content: z.string().max(1000000), message: z.string().min(1).max(200) })

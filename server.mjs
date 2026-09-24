@@ -311,10 +311,17 @@ function checkedGitPath(path) {
 async function githubReadFile(path, ref) {
   const safePath = checkedGitPath(path);
   const safeRef = checkedGitRef(ref);
-  const data = await github('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), { ref: safeRef });
-  if (data.type !== 'file' || !data.content) throw new Error('GitHub path is not a file');
-  const content = Buffer.from(String(data.content).replace(/\n/g, ''), 'base64').toString('utf8');
-  return scrub({ repository: githubRepo, ref: safeRef, path: safePath, sha: data.sha, content });
+  try {
+    const data = await github('/repos/' + githubRepo + '/contents/' + safePath.split('/').map(encodeURIComponent).join('/'), { ref: safeRef });
+    if (data.type !== 'file' || !data.content) throw new Error('GitHub path is not a file');
+    const content = Buffer.from(String(data.content).replace(/\n/g, ''), 'base64').toString('utf8');
+    return scrub({ repository: githubRepo, ref: safeRef, path: safePath, sha: data.sha, content });
+  } catch (e) {
+    const message = String(e?.message || 'unknown error');
+    if (/^GitHub API HTTP \\d{3} PATH \/[^ ]+$/.test(message)) throw e;
+    if (message === 'GitHub path is not a file') throw e;
+    throw new Error('GitHub TEST diagnostic read failed PATH /' + safePath + ' REF ' + safeRef);
+  }
 }
 async function githubSearchCode(query) {
   const q = String(query || '').trim();
@@ -353,7 +360,7 @@ function tool(fn) {
     } catch (e) {
       return {
         isError: true,
-        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API'].includes(e.message) ? e.message : /^GitHub (API|write|cherry-pick) (HTTP \\d{3}( PATH \/[^ ]+)?|git failed:|invalid |merge commits|commit is not an ancestor|test\/main changed|conflict:|)/.test(String(e.message || '')) ? e.message : 'TEST diagnostic request failed.' }]
+        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API'].includes(e.message) ? e.message : /^GitHub (API|write|cherry-pick) (HTTP \\d{3}( PATH \/[^ ]+)?|git failed:|invalid |merge commits|commit is not an ancestor|test\/main changed|conflict:|)/.test(String(e.message || '')) ? e.message : /^GitHub (path is not a file|file SHA changed|TEST file SHA changed|branch ref unavailable|TEST diagnostic)/.test(String(e.message || '')) ? e.message : 'TEST diagnostic request failed.' }]
       };
     }
   };
@@ -362,7 +369,7 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.1' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.2' });
   server.registerTool('github_compare_branches', {
     description: 'Compare FIC-POS test/main with develop before promotion. TEST workflow only.',
     inputSchema: empty

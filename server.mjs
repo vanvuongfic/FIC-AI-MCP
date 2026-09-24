@@ -2,6 +2,8 @@ import { createMcpExpressApp } from '@modelcontextprotocol/express';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { timingSafeEqual } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import * as z from 'zod/v4';
 
 const BASE = 'https://win-house.timxe247.com';
@@ -14,6 +16,8 @@ const githubToken = process.env.GITHUB_TOKEN;
 const githubRepo = 'vanvuongfic/FIC-POS';
 const githubApi = 'https://api.github.com';
 const mountPath = (process.env.MCP_MOUNT_PATH || '/fic-ai-mcp').replace(/\/$/, '');
+const execFileAsync = promisify(execFile);
+const testDeployHelper = '/home/timxerzf/.fic-ai-test-actions/deploy-test.sh';
 
 if (!upstreamSecret || !clientToken || !allowedHost || !githubToken) {
   throw new Error('Set FIC_AI_SECRET, MCP_CLIENT_TOKEN, MCP_ALLOWED_HOST and GITHUB_TOKEN');
@@ -116,6 +120,15 @@ async function githubSearchCode(query) {
     items: items.map(item => ({ name: item.name, path: item.path, sha: item.sha, html_url: item.html_url }))
   });
 }
+async function hostingAction(action) {
+  if (!['status', 'pull', 'clear-cache', 'deploy'].includes(action)) throw new Error('Hosting action not allowed');
+  const { stdout, stderr } = await execFileAsync(testDeployHelper, [action], {
+    timeout: 60000,
+    maxBuffer: 1024 * 1024,
+    env: process.env
+  });
+  return scrub({ action, stdout, stderr });
+}
 async function allowedTables() {
   const data = await upstream('/api/internal/fic-ai/tables');
   return new Set(Array.isArray(data.tables) ? data.tables : []);
@@ -142,7 +155,23 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.2.0' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.3.0' });
+  server.registerTool('hosting_status', {
+    description: 'Read FIC POS Hosting TEST git branch, HEAD and working-tree status. TEST only.',
+    inputSchema: empty
+  }, tool(() => hostingAction('status')));
+  server.registerTool('hosting_pull_test', {
+    description: 'Fast-forward pull origin test/main on FIC POS Hosting TEST. Refuses wrong branch or local changes.',
+    inputSchema: empty
+  }, tool(() => hostingAction('pull')));
+  server.registerTool('hosting_clear_cache', {
+    description: 'Run php artisan optimize:clear on FIC POS Hosting TEST only.',
+    inputSchema: empty
+  }, tool(() => hostingAction('clear-cache')));
+  server.registerTool('hosting_deploy_test', {
+    description: 'Safely deploy FIC POS Hosting TEST: require clean test/main, ff-only pull, then php artisan optimize:clear.',
+    inputSchema: empty
+  }, tool(() => hostingAction('deploy')));
   server.registerTool('github_read_file', {
     description: 'Read one source file from vanvuongfic/FIC-POS. Read-only. Allowed refs: develop and test/main.',
     inputSchema: z.object({

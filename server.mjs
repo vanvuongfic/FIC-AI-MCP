@@ -336,7 +336,7 @@ async function githubSearchCode(query) {
   });
 }
 function checkedHostingPath(path) {
-  const value = String(path || '').replace(/\\/g, '/').replace(/^\\/+/, '');
+  const value = String(path || '').replace(/\\\\/g, '/').replace(/^\/+/, '');
   if (!value || value.length > 500 || value.includes('..') || value.includes('\\0')) throw new Error('Hosting TEST invalid path');
   if (!/^(app|resources|routes|config|public)\//.test(value)) throw new Error('Hosting TEST path not allowed');
   if (/(^|\/)\.env($|\/)|(^|\/)(storage|vendor|node_modules|\.git)(\/|$)/.test(value)) throw new Error('Hosting TEST path not allowed');

@@ -203,7 +203,13 @@ async function githubCherryPickToTest(commitSha) {
     ], { cwd: undefined, timeout: 180000 });
 
     const repoDir = workdir + '/repo';
-    await git(['fetch', '--no-tags', 'origin', 'develop', 'test/main'], { cwd: repoDir });
+    // The clone is --single-branch, so its fetch refspec only tracks test/main.
+    // Fetch both required branches explicitly into remote-tracking refs.
+    await git([
+      'fetch', '--no-tags', 'origin',
+      '+refs/heads/develop:refs/remotes/origin/develop',
+      '+refs/heads/test/main:refs/remotes/origin/test/main'
+    ], { cwd: repoDir });
 
     const targetBefore = (await git(['rev-parse', 'origin/test/main'], { cwd: repoDir })).stdout.trim();
     const developHead = (await git(['rev-parse', 'origin/develop'], { cwd: repoDir })).stdout.trim();

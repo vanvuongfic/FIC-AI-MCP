@@ -2,6 +2,8 @@ import { createMcpExpressApp } from '@modelcontextprotocol/express';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { timingSafeEqual } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as z from 'zod/v4';
@@ -86,7 +88,7 @@ async function github(path, params = {}) {
     },
     signal: AbortSignal.timeout(8000)
   });
-  if (!response.ok) throw new Error('GitHub API HTTP ' + response.status);
+  if (!response.ok) throw new Error('GitHub API HTTP ' + response.status + ' PATH ' + url.pathname);
   const raw = await response.text();
   if (Buffer.byteLength(raw) > 1000000) throw new Error('Response exceeds 1 MB');
   return scrub(JSON.parse(raw));
@@ -162,6 +164,119 @@ async function githubPromoteToTest(expectedDevelopSha) {
   await githubWrite('/repos/' + githubRepo + '/git/refs/heads/test/main', 'PATCH', { sha: developSha, force: false });
   return { repository: githubRepo, changed: true, previous_test_sha: testSha, test_sha: developSha, develop_sha: developSha };
 }
+
+async function githubCherryPickToTest(commitSha) {
+  const value = String(commitSha || '').trim();
+  if (!/^[0-9a-f]{7,40}$/i.test(value)) throw new Error('GitHub cherry-pick invalid commit SHA');
+
+  const workdir = await mkdtemp(tmpdir() + '/fic-ai-cherry-pick-');
+  const gitEnv = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.extraHeader',
+    GIT_CONFIG_VALUE_0: 'Authorization: Bearer ' + githubToken
+  };
+  const git = async (args, options = {}) => {
+    try {
+      return await execFileAsync('git', args, {
+        cwd: options.cwd || workdir,
+        env: gitEnv,
+        timeout: options.timeout || 120000,
+        maxBuffer: 4 * 1024 * 1024
+      });
+    } catch (e) {
+      const detail = String(e.stderr || e.stdout || e.message || '').replace(/[\\r\\n]+/g, ' ').slice(0, 1200);
+      const err = new Error('GitHub cherry-pick git failed: ' + detail);
+      err.code = e.code;
+      throw err;
+    }
+  };
+
+  try {
+    await git([
+      'clone', '--no-tags', '--single-branch', '--branch', 'test/main',
+      'https://github.com/vanvuongfic/FIC-POS.git', workdir + '/repo'
+    ], { cwd: undefined, timeout: 180000 });
+
+    const repoDir = workdir + '/repo';
+    await git(['fetch', '--no-tags', 'origin', 'develop', 'test/main'], { cwd: repoDir });
+
+    const targetBefore = (await git(['rev-parse', 'origin/test/main'], { cwd: repoDir })).stdout.trim();
+    const developHead = (await git(['rev-parse', 'origin/develop'], { cwd: repoDir })).stdout.trim();
+    const resolved = (await git(['rev-parse', value + '^{commit}'], { cwd: repoDir })).stdout.trim();
+
+    const parents = (await git(['rev-list', '--parents', '-n', '1', resolved], { cwd: repoDir })).stdout.trim().split(/\s+/);
+    if (parents.length !== 2) throw new Error('GitHub cherry-pick merge commits are not allowed');
+
+    try {
+      await git(['merge-base', '--is-ancestor', resolved, 'origin/develop'], { cwd: repoDir });
+    } catch {
+      throw new Error('GitHub cherry-pick commit is not an ancestor of develop');
+    }
+
+    try {
+      await git(['merge-base', '--is-ancestor', resolved, 'origin/test/main'], { cwd: repoDir });
+      return {
+        repository: githubRepo,
+        changed: false,
+        reason: 'commit_already_in_test',
+        source_commit_sha: resolved,
+        test_sha: targetBefore,
+        develop_sha: developHead
+      };
+    } catch {
+      // Not the same commit in test/main; continue.
+    }
+
+    const uniqueDevelop = (await git([
+      'log', '--cherry-pick', '--right-only', '--no-merges', '--format=%H',
+      'origin/test/main...origin/develop'
+    ], { cwd: repoDir })).stdout.trim().split(/\s+/).filter(Boolean);
+
+    if (!uniqueDevelop.includes(resolved)) {
+      return {
+        repository: githubRepo,
+        changed: false,
+        reason: 'patch_already_in_test',
+        source_commit_sha: resolved,
+        test_sha: targetBefore,
+        develop_sha: developHead
+      };
+    }
+
+    await git(['config', 'user.name', 'FIC AI TEST'], { cwd: repoDir });
+    await git(['config', 'user.email', 'fic-ai-test@users.noreply.github.com'], { cwd: repoDir });
+
+    try {
+      await git(['cherry-pick', '-x', resolved], { cwd: repoDir });
+    } catch (e) {
+      try { await git(['cherry-pick', '--abort'], { cwd: repoDir }); } catch {}
+      throw new Error('GitHub cherry-pick conflict: ' + String(e.message).slice(0, 1000));
+    }
+
+    await git(['fetch', '--no-tags', 'origin', 'test/main'], { cwd: repoDir });
+    const targetAfterFetch = (await git(['rev-parse', 'origin/test/main'], { cwd: repoDir })).stdout.trim();
+    if (targetAfterFetch !== targetBefore) {
+      throw new Error('GitHub cherry-pick test/main changed during operation; nothing was pushed');
+    }
+
+    const newSha = (await git(['rev-parse', 'HEAD'], { cwd: repoDir })).stdout.trim();
+    await git(['push', 'origin', 'HEAD:refs/heads/test/main'], { cwd: repoDir });
+
+    return {
+      repository: githubRepo,
+      changed: true,
+      source_commit_sha: resolved,
+      previous_test_sha: targetBefore,
+      test_sha: newSha,
+      develop_sha: developHead
+    };
+  } finally {
+    try { await rm(workdir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function checkedGitRef(ref) {
   const value = ref || 'develop';
   if (!['develop', 'test/main'].includes(value)) throw new Error('GitHub ref not allowed');
@@ -217,7 +332,7 @@ function tool(fn) {
     } catch (e) {
       return {
         isError: true,
-        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API'].includes(e.message) ? e.message : 'TEST diagnostic request failed.' }]
+        content: [{ type: 'text', text: ['Response exceeds 1 MB', 'Invalid table', 'Table not allowed by TEST API'].includes(e.message) ? e.message : /^GitHub (API|write|cherry-pick) (HTTP \\d{3}( PATH \/[^ ]+)?|git failed:|invalid |merge commits|commit is not an ancestor|test\/main changed|conflict:|)/.test(String(e.message || '')) ? e.message : 'TEST diagnostic request failed.' }]
       };
     }
   };
@@ -226,7 +341,7 @@ function tool(fn) {
 const empty = z.object({});
 const tableArg = z.object({ table: z.string().regex(tablePattern) });
 const handler = createMcpHandler(() => {
-  const server = new McpServer({ name: 'fic-ai-test', version: '0.4.0' });
+  const server = new McpServer({ name: 'fic-ai-test', version: '0.5.0' });
   server.registerTool('github_compare_branches', {
     description: 'Compare FIC-POS test/main with develop before promotion. TEST workflow only.',
     inputSchema: empty
@@ -247,6 +362,10 @@ const handler = createMcpHandler(() => {
     description: 'Delete one FIC-POS file from develop using its current blob SHA. TEST development only; never writes pro/main.',
     inputSchema: z.object({ path: z.string().min(1).max(500), sha: z.string().min(7).max(64), message: z.string().min(1).max(200) })
   }, tool(({ path, sha, message }) => githubDeleteFileDevelop(path, sha, message)));
+  server.registerTool('github_cherry_pick_to_test', {
+    description: 'Cherry-pick exactly one commit that is an ancestor of develop into test/main. TEST workflow only; never touches pro/main and never force-pushes.',
+    inputSchema: z.object({ commit_sha: z.string().min(7).max(40).regex(/^[0-9a-fA-F]+$/) })
+  }, tool(({ commit_sha }) => githubCherryPickToTest(commit_sha)));
   server.registerTool('github_promote_to_test', {
     description: 'Fast-forward FIC-POS test/main to current develop HEAD only when histories are compatible. Never force pushes and never touches pro/main.',
     inputSchema: z.object({ expected_develop_sha: z.string().min(7).max(64).optional() })
